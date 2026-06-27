@@ -12,24 +12,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
-from langchain_text_splitters import CharacterTextSplitter   # <-- FIXED IMPORT
+from langchain_text_splitters import CharacterTextSplitter
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
-# Optional LLM providers — only import if keys exist so a missing package
-# doesn't crash the whole app.
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("investment_agent")
 
+# ========================= API KEYS (set these in your local .env) =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
 
-# Only treat these as credible financial sources — filters out random
-# unrelated articles (NBA drafts, bird flu, PyPI packages, etc.)
 FINANCE_DOMAINS = [
     "reuters.com", "finance.yahoo.com", "marketwatch.com", "cnbc.com",
     "investing.com", "bloomberg.com", "fool.com", "wsj.com", "ft.com",
@@ -43,10 +43,15 @@ FINANCE_DOMAINS = [
 def is_finance_domain(url: str) -> bool:
     return any(domain in url.lower() for domain in FINANCE_DOMAINS)
 
+
 logger.info(f"GEMINI: {'OK' if GEMINI_API_KEY else 'MISSING'}")
 logger.info(f"GROQ: {'OK' if GROQ_API_KEY else 'MISSING'}")
 logger.info(f"SERPER: {'OK' if SERPER_API_KEY else 'MISSING'}")
 logger.info(f"NEWS_API: {'OK' if NEWS_API_KEY else 'MISSING'}")
+logger.info(f"ALPHA_VANTAGE: {'OK' if ALPHA_VANTAGE_API_KEY else 'MISSING'}")
+logger.info(f"FINNHUB: {'OK' if FINNHUB_API_KEY else 'MISSING'}")
+logger.info(f"FMP: {'OK' if FMP_API_KEY else 'MISSING'}")
+
 
 # ========================= MODELS =========================
 class AnalyzeRequest(BaseModel):
@@ -90,6 +95,9 @@ class FinancialSnapshot(BaseModel):
     industry: Optional[str] = None
     sector: Optional[str] = None
     headquarters: Optional[str] = None
+    ceo: Optional[str] = None
+    website: Optional[str] = None
+    company_name: Optional[str] = None
 
 
 class RiskAssessment(BaseModel):
@@ -166,7 +174,6 @@ class LLMService:
             content = content.split("```json", 1)[1].split("```", 1)[0]
         elif "```" in content:
             content = content.split("```", 1)[1].split("```", 1)[0]
-        # Fallback: grab the first {...} block if there's stray text around it
         content = content.strip()
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
@@ -197,6 +204,7 @@ class LLMService:
 
 
 llm = LLMService()
+
 
 # ========================= RESEARCH (REAL-TIME) =========================
 async def serper_search(client: httpx.AsyncClient, query: str, num: int = 10) -> Dict:
@@ -242,7 +250,6 @@ async def research_agent(company: str) -> Dict:
     company_lower = company.lower().strip()
 
     def is_relevant(text: str) -> bool:
-        """Keep only articles that actually mention the company by name."""
         if not text:
             return False
         return company_lower in text.lower()
@@ -282,22 +289,19 @@ async def research_agent(company: str) -> Dict:
 
         return pass_sources, pass_text
 
-    # First pass: precise, finance-intent query.
     sources, news_text = await run_pass(f'"{company}" stock financial news earnings analysis')
 
-    # Fallback: if nothing relevant came back (common for mega-caps where the
-    # precise query gets crowded out, or for less-covered names), retry with
-    # a broader, more general query before giving up.
     if not news_text.strip():
         sources, news_text = await run_pass(f'"{company}" latest company news')
 
-    # Dedupe sources while preserving order
     seen = set()
     deduped_sources = []
     for s in sources:
         if s not in seen:
             seen.add(s)
             deduped_sources.append(s)
+
+    has_real_news = bool(news_text.strip()) and not news_text.startswith("No live news")
 
     if not news_text.strip():
         news_text = (
@@ -308,10 +312,10 @@ async def research_agent(company: str) -> Dict:
     splitter = CharacterTextSplitter(chunk_size=800, chunk_overlap=100, separator="\n")
     chunks = splitter.split_text(news_text)
 
-    return {"sources": deduped_sources, "news_chunks": chunks, "raw_news": news_text}
+    return {"sources": deduped_sources, "news_chunks": chunks, "raw_news": news_text, "has_real_news": has_real_news}
 
 
-# ========================= FINANCIAL DATA (REAL-TIME via yfinance) =========================
+# ========================= FINANCIAL DATA (REAL-TIME, multi-provider) =========================
 TICKER_MAP = {
     "apple": "AAPL", "tesla": "TSLA", "microsoft": "MSFT", "google": "GOOGL",
     "alphabet": "GOOGL", "amazon": "AMZN", "meta": "META", "facebook": "META",
@@ -320,12 +324,12 @@ TICKER_MAP = {
     "hdfc bank": "HDFCBANK.NS", "icici bank": "ICICIBANK.NS",
 }
 
-# Known well-funded private companies that yfinance will otherwise mis-match
-# to an unrelated ticker/ETF (e.g. "spacex" -> SPCX ETF).
+# Known well-funded private companies that yfinance/other providers will
+# otherwise mis-match to an unrelated ticker (e.g. "spacex" -> SPCX ETF).
 PRIVATE_COMPANIES = {
     "spacex", "openai", "stripe", "byju's", "byjus", "byju", "anthropic",
     "bytedance", "epic games", "databricks", "canva", "shein", "discord",
-    "automattic", "instacart's parent" , "revolut", "klarna", "xai",
+    "automattic", "instacart's parent", "revolut", "klarna", "xai",
 }
 
 
@@ -333,12 +337,173 @@ def is_private_company(company: str) -> bool:
     return company.lower().strip() in PRIVATE_COMPANIES
 
 
-def resolve_symbol(company: str) -> str:
+def resolve_symbol(company: str) -> tuple[str, bool]:
+    """Returns (symbol, is_trusted). is_trusted=True means the symbol came
+    from our curated map and should bypass the name-matching guard below —
+    that guard previously broke on cases like Google->GOOGL, whose yfinance
+    longName is "Alphabet Inc." and therefore failed a naive name check."""
     key = company.lower().strip()
     if key in TICKER_MAP:
-        return TICKER_MAP[key]
-    # If it already looks like a ticker (short, uppercase-ish), try as-is
-    return company.upper().replace(" ", "")
+        return TICKER_MAP[key], True
+    return company.upper().replace(" ", ""), False
+
+
+def _name_matches(company_name: str, info: Dict) -> bool:
+    """Guard against an unrelated ticker/ETF match for untrusted/typed symbols."""
+    long_name = (info.get("longName") or info.get("shortName") or "").lower()
+    if not long_name:
+        return True  # can't verify, don't block
+    first_word = company_name.lower().split()[0]
+    return first_word in long_name or long_name.split()[0] in company_name.lower()
+
+
+def _extract_ceo_yf(info: Dict) -> Optional[str]:
+    """yfinance exposes officers as a list of dicts; CEO title varies by company."""
+    officers = info.get("companyOfficers") or []
+    for officer in officers:
+        title = (officer.get("title") or "").lower()
+        if "chief executive officer" in title or title.strip() == "ceo":
+            return officer.get("name")
+    # Fallback: first officer if no exact CEO title match
+    if officers:
+        return officers[0].get("name")
+    return None
+
+
+def _yfinance_fetch(company: str, symbol: str, trusted: bool):
+    """Runs in a thread (yfinance is sync/blocking)."""
+    ticker = yf.Ticker(symbol)
+    info = ticker.info or {}
+    has_price = info.get("regularMarketPrice") is not None or info.get("currentPrice") is not None
+
+    if info and has_price and (trusted or _name_matches(company, info)):
+        info["_ceo"] = _extract_ceo_yf(info)
+        return symbol, info
+
+    if not trusted:
+        try:
+            search = yf.Search(company, max_results=3)
+            for q in search.quotes:
+                alt_symbol = q.get("symbol")
+                if not alt_symbol:
+                    continue
+                info2 = yf.Ticker(alt_symbol).info or {}
+                if info2 and _name_matches(company, info2):
+                    info2["_ceo"] = _extract_ceo_yf(info2)
+                    return alt_symbol, info2
+        except Exception as e:
+            logger.warning(f"yfinance search fallback failed: {e}")
+
+    return symbol, {}
+
+
+async def _alpha_vantage_fetch(client: httpx.AsyncClient, symbol: str) -> Optional[Dict]:
+    if not ALPHA_VANTAGE_API_KEY:
+        return None
+    try:
+        resp = await client.get(
+            "https://www.alphavantage.co/query",
+            params={"function": "OVERVIEW", "symbol": symbol, "apikey": ALPHA_VANTAGE_API_KEY},
+        )
+        data = resp.json()
+        if not data or "Symbol" not in data:
+            return None
+
+        def _f(key):
+            try:
+                val = data.get(key)
+                return float(val) if val and val != "None" else None
+            except (ValueError, TypeError):
+                return None
+
+        return {
+            "longName": data.get("Name"),
+            "currentPrice": _f("AnalystTargetPrice"),
+            "marketCap": _f("MarketCapitalization"),
+            "trailingPE": _f("PERatio"),
+            "fiftyTwoWeekHigh": _f("52WeekHigh"),
+            "fiftyTwoWeekLow": _f("52WeekLow"),
+            "revenueGrowth": _f("QuarterlyRevenueGrowthYOY"),
+            "profitMargins": _f("ProfitMargin"),
+            "industry": data.get("Industry"),
+            "sector": data.get("Sector"),
+            "city": None, "state": None, "country": data.get("Country"),
+        }
+    except Exception as e:
+        logger.warning(f"Alpha Vantage fetch failed: {e}")
+        return None
+
+
+async def _finnhub_fetch(client: httpx.AsyncClient, symbol: str) -> Optional[Dict]:
+    if not FINNHUB_API_KEY:
+        return None
+    try:
+        profile_resp, quote_resp, metrics_resp = await asyncio.gather(
+            client.get("https://finnhub.io/api/v1/stock/profile2",
+                       params={"symbol": symbol, "token": FINNHUB_API_KEY}),
+            client.get("https://finnhub.io/api/v1/quote",
+                       params={"symbol": symbol, "token": FINNHUB_API_KEY}),
+            client.get("https://finnhub.io/api/v1/stock/metric",
+                       params={"symbol": symbol, "metric": "all", "token": FINNHUB_API_KEY}),
+        )
+        profile = profile_resp.json() or {}
+        quote = quote_resp.json() or {}
+        metrics = (metrics_resp.json() or {}).get("metric", {}) or {}
+
+        if not profile or not profile.get("name"):
+            return None
+
+        market_cap = profile.get("marketCapitalization")
+        return {
+            "longName": profile.get("name"),
+            "currentPrice": quote.get("c"),
+            "marketCap": (market_cap * 1_000_000) if market_cap else None,
+            "trailingPE": metrics.get("peExclExtraTTM"),
+            "fiftyTwoWeekHigh": metrics.get("52WeekHigh"),
+            "fiftyTwoWeekLow": metrics.get("52WeekLow"),
+            "revenueGrowth": metrics.get("revenueGrowthTTMYoy"),
+            "profitMargins": metrics.get("netProfitMarginTTM"),
+            "industry": profile.get("finnhubIndustry"),
+            "sector": None,
+            "city": None, "state": None, "country": profile.get("country"),
+            "_ceo": None,  # Finnhub free tier profile2 doesn't include CEO name
+            "website": profile.get("weburl"),
+        }
+    except Exception as e:
+        logger.warning(f"Finnhub fetch failed: {e}")
+        return None
+
+
+async def _fmp_fetch(client: httpx.AsyncClient, symbol: str) -> Optional[Dict]:
+    if not FMP_API_KEY:
+        return None
+    try:
+        resp = await client.get(
+            f"https://financialmodelingprep.com/api/v3/profile/{symbol}",
+            params={"apikey": FMP_API_KEY},
+        )
+        data = resp.json()
+        if not data or not isinstance(data, list) or not data[0].get("companyName"):
+            return None
+        d = data[0]
+        return {
+            "longName": d.get("companyName"),
+            "currentPrice": d.get("price"),
+            "marketCap": d.get("mktCap"),
+            "trailingPE": None,
+            "fiftyTwoWeekHigh": None,
+            "fiftyTwoWeekLow": None,
+            "revenueGrowth": None,
+            "profitMargins": None,
+            "industry": d.get("industry"),
+            "sector": d.get("sector"),
+            "city": d.get("city"), "state": d.get("state"), "country": d.get("country"),
+            "_ceo": d.get("ceo"),
+            "website": d.get("website"),
+        }
+    except Exception as e:
+        logger.warning(f"FMP fetch failed: {e}")
+        return None
 
 
 async def financial_agent(company: str) -> Dict:
@@ -347,49 +512,31 @@ async def financial_agent(company: str) -> Dict:
             "symbol": None,
             "publicly_traded": False,
             "summary": f"{company} is a privately held company — no public market data available.",
-            "industry": None,
-            "sector": None,
-            "headquarters": None,
+            "industry": None, "sector": None, "headquarters": None,
         }
 
-    symbol = resolve_symbol(company)
-
-    def _name_matches(company_name: str, info: Dict) -> bool:
-        """Guard against yfinance matching an unrelated ticker/ETF (e.g. SpaceX -> SPCX ETF)."""
-        long_name = (info.get("longName") or info.get("shortName") or "").lower()
-        if not long_name:
-            return True  # can't verify, don't block
-        first_word = company_name.lower().split()[0]
-        return first_word in long_name or long_name.split()[0] in company_name.lower()
-
-    def _fetch():
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
-        has_price = info.get("regularMarketPrice") is not None or info.get("currentPrice") is not None
-        if not info or not has_price or not _name_matches(company, info):
-            try:
-                search = yf.Search(company, max_results=3)
-                for q in search.quotes:
-                    alt_symbol = q.get("symbol")
-                    if not alt_symbol:
-                        continue
-                    ticker2 = yf.Ticker(alt_symbol)
-                    info2 = ticker2.info or {}
-                    if info2 and _name_matches(company, info2):
-                        return alt_symbol, info2
-            except Exception as e:
-                logger.warning(f"yfinance search fallback failed: {e}")
-            return symbol, {}  # no reliable match found
-        return symbol, info
+    symbol, trusted = resolve_symbol(company)
 
     try:
-        resolved_symbol, info = await asyncio.to_thread(_fetch)
+        resolved_symbol, info = await asyncio.to_thread(_yfinance_fetch, company, symbol, trusted)
+
+        # Fallback chain: Alpha Vantage -> Finnhub -> FMP, only if yfinance
+        # came back empty (rate-limited, mismatched, transient error, etc.)
+        if not info:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for fetcher in (_alpha_vantage_fetch, _finnhub_fetch, _fmp_fetch):
+                    info = await fetcher(client, symbol)
+                    if info:
+                        resolved_symbol = symbol
+                        logger.info(f"Used fallback provider {fetcher.__name__} for {company}")
+                        break
+
         if not info:
             return {
                 "symbol": None,
                 "publicly_traded": False,
-                "summary": f"Could not confidently match '{company}' to a public ticker — "
-                           f"treating as not publicly traded or data unavailable.",
+                "summary": f"Could not retrieve market data for '{company}' from any provider — "
+                           f"treating as unavailable rather than guessing.",
                 "industry": None, "sector": None, "headquarters": None,
             }
 
@@ -402,16 +549,19 @@ async def financial_agent(company: str) -> Dict:
         low_52 = info.get("fiftyTwoWeekLow")
         industry = info.get("industry")
         sector = info.get("sector")
-        city = info.get("city")
-        state = info.get("state")
-        country = info.get("country")
-        headquarters = ", ".join([p for p in [city, state, country] if p]) or None
+        headquarters = ", ".join(
+            p for p in [info.get("city"), info.get("state"), info.get("country")] if p
+        ) or None
+        ceo = info.get("_ceo")
+        website = info.get("website")
+        company_name = info.get("longName") or info.get("shortName") or company
 
         summary = (
             f"Symbol: {resolved_symbol} | Price: {current_price} | "
             f"Revenue Growth: {revenue_growth}% | Profit Margin: {profit_margin}% | "
             f"P/E: {pe_ratio} | Market Cap: {market_cap} | "
             f"52W Range: {low_52}-{high_52} | Sector: {sector} | Industry: {industry}"
+            + (f" | CEO: {ceo}" if ceo else "")
         )
 
         return {
@@ -428,6 +578,9 @@ async def financial_agent(company: str) -> Dict:
             "industry": industry,
             "sector": sector,
             "headquarters": headquarters,
+            "ceo": ceo,
+            "website": website,
+            "company_name": company_name,
         }
     except Exception as e:
         logger.error(f"Financial agent error for {company} ({symbol}): {e}")
@@ -439,7 +592,19 @@ async def financial_agent(company: str) -> Dict:
 
 
 # ========================= NEWS ANALYSIS AGENT =========================
-async def news_analysis_agent(company: str, news_chunks: List[str]) -> Dict:
+async def news_analysis_agent(company: str, news_chunks: List[str], has_real_news: bool = True) -> Dict:
+    if not has_real_news:
+        return {
+            "sentiment": "Neutral",
+            "score": 50,
+            "positives": [],
+            "negatives": [],
+            "key_highlights": [
+                "No live news data available — check SERPER_API_KEY / NEWS_API_KEY configuration. "
+                "Score defaulted to neutral (50) rather than penalizing the company for missing coverage."
+            ],
+        }
+
     context = "\n\n".join(news_chunks[:5])
     prompt = f"""Analyze the following recent news about {company}:
 
@@ -548,17 +713,10 @@ def compute_rule_based_score(financial: Dict, news: Dict, risk: Dict) -> Dict:
     if pe_ratio is not None and pe_ratio > 0 and pe_ratio > 60:
         score -= 5; notes.append("Very high valuation/P-E (-5)")
 
-    # News sentiment: centered around neutral=50 so a lack of strong signal
-    # doesn't silently inflate or deflate the score.
     news_adjustment = int(round((news_score - 50) * 0.30))
     score += news_adjustment
     notes.append(f"News sentiment adjustment ({news_score}/100) ({'+' if news_adjustment >= 0 else ''}{news_adjustment})")
 
-    # Risk penalty: lightened — previously 0.20 was too punitive and could
-    # single-handedly drag a fundamentally strong company (e.g. Microsoft)
-    # down to WATCH, or a moderately-struggling one (e.g. Intel) to near 0.
-    # Also centered around a "normal" baseline risk of 40 so routine,
-    # non-extreme risk scores don't tank the score.
     risk_adjustment = int(round(max(0, risk_score - 40) * 0.25))
     score -= risk_adjustment
     notes.append(f"Risk penalty ({risk_score}/100, baseline 40) (-{risk_adjustment})")
@@ -588,7 +746,6 @@ def compute_committee_vote(financial: Dict, news: Dict, risk: Dict, swot: Dict, 
             "final_decision": "WATCH",
         }
 
-    # Financial agent votes from raw fundamentals only.
     fin_score = 50
     rg, pm = financial.get("revenue_growth"), financial.get("profit_margin")
     if rg is not None:
@@ -597,14 +754,11 @@ def compute_committee_vote(financial: Dict, news: Dict, risk: Dict, swot: Dict, 
         fin_score += 15 if pm > 25 else 10 if pm > 10 else 3 if pm > 0 else (-20 if pm < 0 else 0)
     financial_vote = _label_from_score(max(0, min(100, fin_score)))
 
-    # News agent votes from sentiment score alone.
     news_vote = _label_from_score(news.get("score", 50), invest_at=70, watch_at=45)
 
-    # Risk agent votes inversely from risk score (high risk = cautious).
     risk_score = risk.get("risk_score", 50)
     risk_vote = "PASS" if risk_score > 70 else "WATCH" if risk_score > 40 else "INVEST"
 
-    # SWOT agent votes from the strengths/opportunities vs weaknesses/threats balance.
     positives = len(swot.get("strengths", [])) + len(swot.get("opportunities", []))
     negatives = len(swot.get("weaknesses", [])) + len(swot.get("threats", []))
     if positives - negatives >= 2:
@@ -623,14 +777,12 @@ def compute_committee_vote(financial: Dict, news: Dict, risk: Dict, swot: Dict, 
     }
 
 
-
 async def decision_agent(state: Dict) -> Dict:
     rule_result = state.get("rule_score", {"score": 50, "notes": []})
     rule_score = rule_result["score"]
     financial = state.get("financial", {})
 
     if not financial.get("publicly_traded", True):
-        # Don't even ask the LLM to invent a number — private companies get WATCH.
         prompt = f"""{state['company']} is a privately held company (no public stock).
 Financial data: {financial}
 News analysis: {state.get('news')}
@@ -679,7 +831,6 @@ Return ONLY valid JSON in exactly this shape:
 }}"""
     result = await llm.generate(prompt, "You are an Investment Committee. Return clean JSON only, no markdown.")
     result = result or {}
-    # Hard-enforce the deterministic score regardless of what the LLM returns.
     result["overall_score"] = rule_score
     if "recommendation" not in result or not result["recommendation"]:
         result["recommendation"] = "INVEST" if rule_score >= 70 else "WATCH" if rule_score >= 40 else "PASS"
@@ -709,7 +860,8 @@ async def research_node(state: AgentState):
 
 async def analysis_node(state: AgentState):
     news, swot, risk = await asyncio.gather(
-        news_analysis_agent(state["company"], state["research"].get("news_chunks", [])),
+        news_analysis_agent(state["company"], state["research"].get("news_chunks", []),
+                             state["research"].get("has_real_news", True)),
         swot_agent(state["company"], state["financial"], state["research"].get("news_chunks", [])),
         risk_agent(state["company"], state["financial"], state["research"].get("news_chunks", [])),
     )
@@ -739,7 +891,7 @@ graph = build_graph()
 # ========================= FASTAPI APP =========================
 app = FastAPI(
     title="AI Investment Research Agent",
-    version="3.0",
+    version="3.1",
     description="Real-time news + financial analysis using LangGraph multi-agent workflow.",
 )
 
@@ -750,12 +902,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def health():
     return {
         "status": "healthy",
-        "version": "3.0",
+        "version": "3.1",
         "providers": {
             "gemini": bool(GEMINI_API_KEY),
             "groq": bool(GROQ_API_KEY),
             "serper": bool(SERPER_API_KEY),
             "newsapi": bool(NEWS_API_KEY),
+            "alpha_vantage": bool(ALPHA_VANTAGE_API_KEY),
+            "finnhub": bool(FINNHUB_API_KEY),
+            "fmp": bool(FMP_API_KEY),
         },
     }
 
